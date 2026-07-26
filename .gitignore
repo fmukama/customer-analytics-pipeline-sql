@@ -1,0 +1,32 @@
+# Environment & Secrets
+.env
+*.env
+!.env.example
+
+# Python & Virtual Environments
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# NOTE: uv.lock is intentionally NOT ignored - commit it so CI resolves the
+# exact same dependency versions as the local .venv.
+
+# Internal planning notes (not part of the submission)
+flow.md
+
+# Testing & Linting Caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.sqlfluff_cache/
+
+# Runtime logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
