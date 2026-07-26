@@ -1,0 +1,100 @@
+[project]
+name = "inventory-order-management"
+version = "0.1.0"
+description = "E-Commerce Inventory and Order Management System (PostgreSQL 16)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "psycopg2-binary>=2.9.9",
+    "python-dotenv>=1.0.1",
+    "faker>=24.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "sqlfluff>=3.0.0",
+    "ruff>=0.3.0",
+]
+
+# This repository is a runnable project, not a distributable library. Telling uv
+# not to build it avoids setuptools' auto-discovery error ("Multiple top-level
+# packages discovered: src, sql, docs"). `src` stays importable because every
+# entry point is invoked from the repo root (e.g. `uv run python -m src.seed`).
+[tool.uv]
+package = false
+
+# ---------------------------------------------------------------------------
+# Pytest
+# ---------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short --strict-markers"
+# tests/ has no __init__.py, so pytest would put tests/ on sys.path rather than
+# the repo root, and `from src.utils import ...` in conftest.py would fail.
+# The project is deliberately not pip-installed (see [tool.uv] package), so add
+# the root explicitly.
+pythonpath = ["."]
+markers = [
+    "schema: Structural and constraint validation tests",
+    "triggers: Database automation trigger tests",
+    "procedures: Stored procedure and transaction atomicity tests",
+]
+
+# ---------------------------------------------------------------------------
+# Ruff
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "UP"]
+
+# Without this, `from src.logger import ...` is sorted into the third-party
+# block and rule I001 fails CI.
+[tool.ruff.lint.isort]
+known-first-party = ["src", "tests"]
+
+# ---------------------------------------------------------------------------
+# SQLFluff
+# ---------------------------------------------------------------------------
+
+[tool.sqlfluff.core]
+dialect = "postgres"
+# "raw" disables Jinja templating. The default jinja templater would try to
+# interpret braces inside SQL literals and dollar-quoted PL/pgSQL bodies.
+templater = "raw"
+max_line_length = 120
+# RF01 misfires on columns resolved through PL/pgSQL bodies and view aliases.
+# AM04/ST06 penalise the wildcard-free view definitions we already use.
+# PG01 demands CREATE INDEX ... CONCURRENTLY. That is actively wrong here:
+# CONCURRENTLY cannot run inside a transaction block (01_schema.sql is applied
+# as one atomic batch) and buys nothing on a table that is empty at build time.
+exclude_rules = "RF01, AM04, ST06, PG01"
+
+[tool.sqlfluff.indentation]
+implicit_indents = "allow"
+
+[tool.sqlfluff.rules.capitalisation.keywords]
+capitalisation_policy = "upper"
+
+[tool.sqlfluff.rules.capitalisation.identifiers]
+extended_capitalisation_policy = "lower"
+
+[tool.sqlfluff.rules.capitalisation.functions]
+# Built-in aggregates upper (ROUND, SUM, COALESCE), but this project's own
+# objects and PostgreSQL's snake_case system functions/namespaces keep their
+# lower-case names. CP03 cannot express that split on its own, so both sets
+# are exempted explicitly.
+extended_capitalisation_policy = "upper"
+ignore_words_regex = "^(fn_|sp_|trg_|v_|gen_random_uuid|pg_|jsonb_)"
+
+[tool.sqlfluff.rules.capitalisation.literals]
+capitalisation_policy = "upper"
+
+[tool.sqlfluff.rules.capitalisation.types]
+extended_capitalisation_policy = "upper"

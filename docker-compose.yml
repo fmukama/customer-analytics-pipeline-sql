@@ -1,0 +1,56 @@
+name: ecom-inventory
+
+# ---------------------------------------------------------------------------
+# Local infrastructure for the Inventory & Order Management System.
+# Every value falls back to a sane default, so `docker compose up -d --wait`
+# works even before you copy .env.example -> .env.
+# ---------------------------------------------------------------------------
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ecom_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ecom_inventory}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      # Pin the server clock to UTC so order_date / logged_at values in the
+      # reports are reproducible regardless of the host timezone.
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Read-only mount so `make init-db` can run `psql -f /sql/01_schema.sql`
+      # inside the container. Deliberately NOT mounted at
+      # /docker-entrypoint-initdb.d, because that path only fires once on an
+      # empty volume and would also execute the reporting scripts on boot.
+      - ./sql:/sql:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-ecom_inventory}
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  adminer:
+    image: adminer:5
+    container_name: ecom_adminer
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+      ADMINER_DESIGN: dracula
+    ports:
+      - "${ADMINER_PORT:-8080}:8080"
+
+volumes:
+  pgdata:
+    name: ecom_pgdata
