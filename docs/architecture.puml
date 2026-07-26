@@ -1,0 +1,156 @@
+@startuml architecture
+!theme plain
+top to bottom direction
+
+skinparam componentStyle rectangle
+skinparam databaseBackgroundColor #F9F9F9
+skinparam nodeBackgroundColor #FFFFFF
+skinparam packageBackgroundColor #FFFFFF
+
+title E-Commerce Inventory & Order Management System
+
+' CONTROL PLANE & QUALITY ASSURANCE
+
+package "Control Plane & CI/CD Layer" #E1F5FE {
+    [GitHub Actions CI Workflow] as CICD #LightBlue
+    
+    package "Quality, Testing & Linting" #FFEBEE {
+        [SQLFluff Linter] as SQLFluff
+        [Ruff Python Linter] as Ruff
+        [Pytest Test Suite\n(tests/conftest.py bootstraps schema,\nrolls back every test)] as Pytest
+    }
+}
+
+' LOCAL DEVELOPER TOOLING
+
+package "Developer Tooling" #F3E5F5 {
+    [Makefile\n(make up / init-db / seed / verify)] as MakeCLI
+    [uv\n(pins Python 3.11, uv.lock)] as Uv
+    [docker-compose.yml\n(postgres + adminer)] as Compose
+    file ".env  <-  .env.example" as EnvFile #LightGray
+}
+
+' OPERATIONAL DOMAIN (POSTGRESQL 16 OLTP)
+
+package "Operational Domain (PostgreSQL 16 in Docker)" #E8F5E9 {
+    
+    database "PostgreSQL 16 Database" as Postgres {
+        package "Tables & Constraints (sql/01_schema.sql)" as Tables {
+            [customers] as Customers
+            [products] as Products
+            [orders] as Orders
+            [order_details] as OrderDetails
+            [inventory_logs] as InvLogs
+        }
+
+        package "Automation & Triggers (sql/02_triggers.sql)" as Triggers {
+            [trg_apply_bulk_discount] as DiscountTrg
+            [trg_process_inventory_and_log] as InvTrg
+            [trg_update_order_total] as TotalTrg
+            [trg_recalculate_customer_tier] as TierTrg
+        }
+
+        package "Atomic Procedures (sql/03_procedures.sql)" as Procedures {
+            [sp_place_order()] as PlaceOrderProc
+            [sp_replenish_stock()] as ReplenishProc
+        }
+
+        package "Operational Views (sql/04_views.sql)" as Views {
+            [v_order_summary] as ViewOrderSummary
+            [v_low_stock_alerts] as ViewLowStock
+        }
+    }
+
+    [Adminer 5 Web UI\n(localhost:8080)] as Adminer #LightYellow
+}
+
+' APPLICATION & EXECUTION LAYER
+
+package "Application & Scripting Layer" #FFF3E0 {
+    [Python Mock Seeder\n(src/seed.py via Faker)] as SeedScript
+    [DB Connection Client\n(src/utils.py)] as DBClient
+    [Central Logger\n(src/logger.py)] as Logger
+    file "logs/app.log" as LocalLogFile #LightGray
+}
+
+' REPORTING & OUTPUTS
+
+package "Reporting & Insights" #E0F7FA {
+    [Customer Spending & Tier Report\n(05_reports_and_queries.sql)] as RptCust
+    [Order Summary Insights\n(05_reports_and_queries.sql)] as RptOrders
+    [Inventory Audit & Reorder Report\n(05_reports_and_queries.sql)] as RptStock
+    [EXPLAIN ANALYZE Benchmarks\n(05_reports_and_queries.sql)] as RptPerf
+    [End-to-End Deliverable Walkthrough\n(sql/06_demo.sql)] as DemoScript #LightYellow
+}
+
+' DOCUMENTATION
+
+package "Documentation" #FAFAFA {
+    [README.md\n(setup, deliverable map, outputs)] as Readme
+    [docs/entity.puml\n(ER diagram)] as DocErd
+    [docs/architecture.puml\n(this diagram)] as DocArch
+}
+
+' RELATIONSHIPS & DATA FLOWS
+
+' Application & Seeder Connections
+SeedScript --> DBClient : Uses connection
+DBClient --> Postgres : Connects via psycopg2
+SeedScript --> PlaceOrderProc : Calls atomically to seed orders
+SeedScript --> Logger : Writes execution logs
+Logger --> LocalLogFile : Appends to local file
+
+' Procedure & Trigger Flows
+PlaceOrderProc --> Orders : Creates Order record
+PlaceOrderProc --> OrderItems : Inserts Order Line Items
+
+OrderItems ..> DiscountTrg : BEFORE INSERT\nCalculates bulk discount
+OrderItems ..> InvTrg : AFTER INSERT\nDeducts product stock
+InvTrg --> Products : Updates stock_quantity
+InvTrg --> InvLogs : Inserts audit row ('ORDER_PLACEMENT')
+
+OrderItems ..> TotalTrg : AFTER INSERT/UPDATE/DELETE\nUpdates orders.total_amount
+Orders ..> TierTrg : AFTER UPDATE (total_amount/status)\nUpdates customers.total_spent & customer_tier
+TierTrg --> Customers : Promotes tier (Bronze/Silver/Gold)
+
+ReplenishProc --> Products : Adds stock_quantity
+ReplenishProc --> InvLogs : Inserts audit row ('REPLENISHMENT')
+
+' Views & Reporting Flows
+Tables --> Views : Aggregates underlying tables
+ViewOrderSummary --> RptOrders : Powers order summaries
+ViewLowStock --> RptStock : Powers reorder alerts
+Customers --> RptCust : Reads spending & tiers
+InvLogs --> RptStock : Audits replenishment history
+
+' Local Developer Tooling Flows
+MakeCLI --> Compose : make up (--wait on healthcheck)
+Compose --> Postgres : Provisions PostgreSQL 16 + named volume
+Compose --> Adminer : Provisions DB browser
+Adminer --> Postgres : Inspects tables, views & logs
+MakeCLI --> Postgres : make init-db\n(psql -f /sql/*.sql inside container)
+MakeCLI --> Uv : make seed / lint / test
+Uv --> SeedScript : uv run python -m src.seed
+Uv --> Pytest : uv run pytest
+EnvFile --> Compose : Supplies ports & credentials
+EnvFile --> DBClient : Loaded via python-dotenv
+
+' Demonstration & Performance Evidence
+DemoScript --> PlaceOrderProc : Places a multi-product order
+DemoScript --> ReplenishProc : Replenishes flagged low-stock items
+DemoScript --> ViewLowStock : Shows before/after reorder state
+RptPerf --> Tables : EXPLAIN ANALYZE on indexed access paths
+
+' Documentation Ties
+Readme --> DocErd : Embeds ER diagram
+Readme --> DocArch : Embeds architecture diagram
+Readme --> MakeCLI : Documents the command surface
+
+' CI/CD & Testing Ties
+CICD --> SQLFluff : Lints .sql files on push & PR
+CICD --> Ruff : Lints Python code on push & PR
+CICD --> Uv : uv sync (resolves from uv.lock)
+CICD --> Pytest : Spins up Postgres service & runs integration tests
+Pytest --> Postgres : Tests Schema, Triggers, & Procedures
+
+@enduml

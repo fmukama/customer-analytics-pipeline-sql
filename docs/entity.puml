@@ -1,0 +1,198 @@
+@startuml entity
+!theme plain
+hide circle
+skinparam linetype ortho
+skinparam entity {
+    BackgroundColor #FFFFFF
+    BorderColor #333333
+    HeaderBackgroundColor #E8F5E9
+}
+
+title Operational Domain (OLTP) - Entity Relationship Diagram
+
+' ENTITIES & SCHEMAS
+
+entity "customers" as customers {
+    * **customer_id** : UUID [PK, DEFAULT gen_random_uuid()]
+    --
+    * **full_name** : VARCHAR(100)
+    * **email** : VARCHAR(255) [UNIQUE]
+      phone_number : VARCHAR(20)
+    * **total_spent** : NUMERIC(12, 2) [DEFAULT 0, maintained by trigger]
+    * **customer_tier** : VARCHAR(10) [CHECK IN ('Bronze','Silver','Gold'), DEFAULT 'Bronze']
+    * **created_at** : TIMESTAMP WITH TIME ZONE [DEFAULT now()]
+    * **updated_at** : TIMESTAMP WITH TIME ZONE [DEFAULT now()]
+}
+
+entity "products" as products {
+    * **product_id** : UUID [PK, DEFAULT gen_random_uuid()]
+    --
+    * **product_name** : VARCHAR(150)
+    * **category** : VARCHAR(50)
+    * **unit_price** : NUMERIC(10, 2) [CHECK > 0]
+    * **stock_quantity** : INTEGER [CHECK >= 0, DEFAULT 0]
+    * **reorder_level** : INTEGER [CHECK >= 0, DEFAULT 10]
+    * **reorder_quantity** : INTEGER [CHECK > 0, DEFAULT 50]
+    * **created_at** : TIMESTAMP WITH TIME ZONE [DEFAULT now()]
+    * **updated_at** : TIMESTAMP WITH TIME ZONE [DEFAULT now()]
+}
+
+entity "orders" as orders {
+    * **order_id** : UUID [PK, DEFAULT gen_random_uuid()]
+    --
+    * **customer_id** : UUID [FK -> customers.customer_id, ON DELETE RESTRICT]
+    * **order_date** : TIMESTAMP WITH TIME ZONE [DEFAULT now()]
+    * **total_amount** : NUMERIC(12, 2) [DEFAULT 0, CHECK >= 0, maintained by trigger]
+    * **order_status** : VARCHAR(20) [CHECK IN ('PENDING','CONFIRMED','CANCELLED'), DEFAULT 'PENDING']
+    * **created_at** : TIMESTAMP WITH TIME ZONE [DEFAULT now()]
+    * **updated_at** : TIMESTAMP WITH TIME ZONE [DEFAULT now()]
+}
+
+entity "order_details" as order_details {
+    * **order_detail_id** : UUID [PK, DEFAULT gen_random_uuid()]
+    --
+    * **order_id** : UUID [FK -> orders.order_id]
+    * **product_id** : UUID [FK -> products.product_id]
+    * **quantity** : INTEGER [CHECK > 0]
+    * **unit_price** : NUMERIC(10, 2) [CHECK > 0, snapshot at order time]
+    * **discount_percent** : NUMERIC(5, 2) [CHECK BETWEEN 0 AND 100, DEFAULT 0, set by bulk-discount rule]
+    * **subtotal** : NUMERIC(12, 2) [GENERATED: quantity * unit_price * (1 - discount_percent / 100)]
+    --
+    UNIQUE (order_id, product_id)
+}
+
+entity "inventory_logs" as inventory_logs {
+    * **log_id** : BIGSERIAL [PK]
+    --
+    * **product_id** : UUID [FK -> products.product_id]
+      order_id : UUID [FK -> orders.order_id, OPTIONAL]
+    * **change_quantity** : INTEGER
+    * **previous_stock** : INTEGER
+    * **new_stock** : INTEGER
+    * **change_reason** : VARCHAR(24) [CHECK IN ('ORDER_PLACEMENT','ORDER_CANCELLATION','REPLENISHMENT','MANUAL_ADJUSTMENT')]
+    * **logged_at** : TIMESTAMP WITH TIME ZONE [DEFAULT now()]
+    --
+    CHECK (new_stock = previous_stock + change_quantity)
+}
+
+' RELATIONSHIPS & CARDINALITY
+
+customers ||..o{ orders : "1. Places (0 to N)"
+orders ||..|{ order_details : "2. Contains (1 to N)"
+products ||..o{ order_details : "3. Referenced in (0 to N)"
+products ||..o{ inventory_logs : "4. Tracks history (0 to N)"
+orders |o..o{ inventory_logs : "5. Optionally links audit record"
+
+' INDEXES (Performance Optimization)
+
+note left of orders
+  **Indexes:**
+  * idx_orders_customer_id ON orders(customer_id)
+  * idx_orders_order_date ON orders(order_date DESC)
+  * idx_orders_customer_status
+      ON orders(customer_id, order_status)
+      INCLUDE (total_amount)
+    Serves the tier recompute aggregate as an index-only
+    scan — no heap fetch per order.
+end note
+
+note left of order_details
+  **Indexes:**
+  * idx_order_details_order_id ON order_details(order_id)
+  * idx_order_details_product_id ON order_details(product_id)
+  Both FK columns are indexed deliberately: PostgreSQL does
+  NOT auto-index foreign keys, and v_order_summary joins on
+  order_id while the top-sellers report groups by product_id.
+end note
+
+note bottom of inventory_logs
+  **Indexes:**
+  * idx_inventory_logs_product_id ON inventory_logs(product_id)
+  * idx_inventory_logs_logged_at ON inventory_logs(logged_at DESC)
+
+  **Automated Audit Triggers (Inventory Logging):**
+  * Whenever an `order_details` record is inserted:
+    1. The product row is taken with SELECT ... FOR UPDATE
+       (serialises concurrent buyers of the same product).
+    2. `products.stock_quantity` decreases by `quantity`.
+    3. An audit row enters `inventory_logs` with
+       `change_reason = 'ORDER_PLACEMENT'` and `order_id`
+       set, capturing previous_stock and new_stock.
+  * Replenishment adds to stock with
+    `change_reason = 'REPLENISHMENT'` (order_id NULL).
+  * Cancelling an order returns stock with
+    `change_reason = 'ORDER_CANCELLATION'`.
+
+  This table is append-only — never UPDATE or DELETE a row.
+  That is what makes the audit history ("full history retrievable for auditing") trustworthy.
+
+  **UUID note:** `gen_random_uuid()` is built into
+  PostgreSQL 13+, so the pgcrypto extension is NOT needed.
+end note
+
+note right of products
+  **Data Integrity Rules:**
+  * `stock_quantity` cannot drop below 0 (`CHECK` constraint).
+    This CHECK is the last line of defence for oversell:
+    sp_place_order raises a friendly exception first, the
+    constraint guarantees correctness if anything slips past.
+  * Low stock state: `stock_quantity <= reorder_level`.
+
+  **Performance Indexes:**
+  * idx_products_category ON products(category)
+  * idx_products_low_stock ON products(product_id)
+      WHERE stock_quantity <= reorder_level
+    A partial index: it holds only the handful of rows
+    v_low_stock_alerts cares about, so the reorder report
+    stays O(low-stock rows) instead of scanning the catalogue.
+end note
+
+note right of customers
+  **Automated Customer Tier Updates:**
+  * `total_spent` and `customer_tier` are recalculated by a
+    trigger (AFTER INSERT/UPDATE on orders) whenever an
+    order is confirmed — no manual recomputation needed.
+
+  **Tier thresholds (on total_spent):**
+  * Bronze : < 1000.00
+  * Silver : >= 1000.00 and < 5000.00
+  * Gold   : >= 5000.00
+
+  **The trigger must RECOMPUTE, not increment:**
+    total_spent = COALESCE((
+      SELECT SUM(total_amount) FROM orders
+      WHERE customer_id = <c> AND order_status <> 'CANCELLED'
+    ), 0)
+  A multi-item order fires the total-amount trigger once per
+  item, so an incremental `total_spent += x` would multiply
+  the spend. An aggregate recompute is idempotent and stays
+  correct when an order is later cancelled.
+end note
+
+note right of order_details
+  **Spec mapping:** this table IS the brief's "Order Details"
+  entity (products ordered, their quantities, their prices).
+
+  **Bulk discount rule (applied BEFORE INSERT):**
+  * quantity >= 10  -> 5% off
+  * quantity >= 25  -> 10% off
+  * quantity >= 50  -> 15% off
+  Evaluate the bands top-down (50, then 25, then 10) so the
+  largest qualifying discount wins.
+
+  **`subtotal` generated column:**
+    GENERATED ALWAYS AS (
+      ROUND(quantity * unit_price
+            * (1 - discount_percent / 100.0), 2)
+    ) STORED
+  `unit_price` is a snapshot copied from products at order
+  time, so historical order totals never drift when a
+  product is repriced.
+
+  **UNIQUE (order_id, product_id) consequence:**
+  sp_place_order must aggregate repeated product_ids in its
+  input payload into a single line before inserting, or the
+  constraint will reject the order.
+end note
+
+@enduml
