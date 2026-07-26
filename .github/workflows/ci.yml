@@ -1,0 +1,135 @@
+name: E-commerce CI Pipeline
+
+on:
+  # This repo's default branch is `master`; `main` is listed too so the pipeline
+  # keeps working if the branch is ever renamed.
+  #
+  # paths-ignore keeps this "slim": a push that only touches docs/markdown
+  # (README, the brief, diagram sources/renders, .gitignore) never spins up
+  # the Postgres integration job at all. Anything that could plausibly
+  # affect behavior - sql/, src/, tests/, pyproject.toml, uv.lock, this
+  # workflow file itself - is deliberately NOT in this list, so it still
+  # runs the full pipeline.
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - ".gitignore"
+  pull_request:
+    branches: [main, master]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - ".gitignore"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-format:
+    name: Lint (SQLFluff + Ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # uv reads .python-version and requires-python, so the interpreter here
+      # is byte-identical to the local .venv (3.11).
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Lint SQL
+        run: uv run sqlfluff lint sql/
+
+      - name: Lint Python
+        run: uv run ruff check src tests
+
+  integration-tests:
+    name: Integration tests (PostgreSQL 16)
+    needs: lint-and-format
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: ecom_test
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ecom_test
+      POSTGRES_USER: test_user
+      POSTGRES_PASSWORD: test_password
+      PGPASSWORD: test_password
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      # Smoke check: proves every script loads into a clean PostgreSQL 16
+      # instance with ON_ERROR_STOP, independently of the Python test harness.
+      - name: Apply schema, triggers, procedures and views
+        run: |
+          for f in sql/01_schema.sql sql/02_triggers.sql \
+                   sql/03_procedures.sql sql/04_views.sql; do
+            echo ">> $f"
+            psql -h localhost -U test_user -d ecom_test -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      # conftest.py re-applies the same scripts per session. Running them twice
+      # is intentional - it proves 01_schema.sql is idempotent (DROP ... CASCADE
+      # first), which is what makes `make init-db` safe to re-run locally.
+      # test_concurrency.py commits real rows on a second connection outside
+      # the rollback-based fixtures, but deletes them again before asserting,
+      # so the schema is left empty either way.
+      - name: Run Pytest suite
+        run: uv run pytest
+
+      # Regression coverage for README Step 5: this exact command is what a
+      # grader runs by hand, and it is the only thing that exercises
+      # sql/06_demo.sql. A past version of this script violated
+      # orders_customer_id_fkey during its own cleanup, which aborted the
+      # whole transaction before COMMIT - passing tests alone did not catch
+      # that, because pytest never executes this file.
+      - name: Run end-to-end demo walkthrough
+        run: |
+          psql -h localhost -U test_user -d ecom_test -v ON_ERROR_STOP=1 \
+            -f sql/06_demo.sql
+
+      # Regression coverage for src/seed.py: proves its SEED_*_COUNT env vars
+      # still match the names in .env.example / README, and that it runs
+      # cleanly against the schema this job just built.
+      - name: Run Faker seed script
+        env:
+          SEED_CUSTOMERS_COUNT: "20"
+          SEED_PRODUCTS_COUNT: "10"
+          SEED_ORDERS_COUNT: "30"
+        run: uv run python -m src.seed
+
+      - name: Execute reporting queries
+        run: |
+          psql -h localhost -U test_user -d ecom_test -v ON_ERROR_STOP=1 \
+            -f sql/05_reports_and_queries.sql
